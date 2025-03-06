@@ -1,7 +1,10 @@
 package analyze
 
 import (
+	"flag"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
@@ -191,16 +194,22 @@ func TestBrokenSymlinkSkipped(t *testing.T) {
 	assert.Equal(t, '!', dir.Files[0].GetFlag())
 }
 
+var benchdir = flag.String("benchdir", filepath.Join(runtime.GOROOT(), "src"),
+	"Directory to run benchmarks in.")
+
 func BenchmarkAnalyzeDir(b *testing.B) {
-	fin := testdir.CreateTestDir()
-	defer fin()
-
-	b.ResetTimer()
-
-	analyzer := CreateAnalyzer()
-	dir := analyzer.AnalyzeDir(
-		"test_dir", func(_, _ string) bool { return false }, false,
-	)
-	analyzer.GetDone().Wait()
-	dir.UpdateStats(make(fs.HardLinkedItems))
+	root := *benchdir
+	if _, err := os.Stat(root); err != nil {
+		b.Skipf("invalid benchmark directory %q: %v", root, err)
+	}
+	for i := 0; i < b.N; i++ {
+		analyzer := CreateAnalyzer()
+		// analyzer.ResetProgress()
+		dir := analyzer.AnalyzeDir(
+			root, func(_, _ string) bool { return false }, true,
+		)
+		// analyzer.GetDone().Wait()
+		_ = dir
+		dir.UpdateStats(make(fs.HardLinkedItems))
+	}
 }
