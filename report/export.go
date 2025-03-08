@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -165,38 +166,22 @@ func (ui *UI) exportDir(dir fs.Item, waitWritten *sync.WaitGroup) error {
 	return nil
 }
 
-func (ui *UI) updateProgress() {
-	waitingForWrite := false
+var progressRunes = [...]rune{'⠇', '⠏', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'}
 
-	emptyRow := "\r"
-	for j := 0; j < 100; j++ {
-		emptyRow += " "
+func (ui *UI) updateProgress() {
+	i := 0
+	nextProgressRune := func() string {
+		i++
+		return string(progressRunes[i%len(progressRunes)])
 	}
 
-	progressRunes := []rune(`⠇⠏⠋⠙⠹⠸⠼⠴⠦⠧`)
+	waitingForWrite := false
+	emptyRow := "\r" + strings.Repeat(" ", 100)
 
-	progressChan := ui.Analyzer.GetProgressChan()
-	doneChan := ui.Analyzer.GetDone()
-
-	var progress common.CurrentProgress
-
-	i := 0
-	for {
+	updateProgress := func() {
+		progress := ui.Analyzer.GetCurrentProgress()
 		fmt.Fprint(ui.output, emptyRow)
-
-		select {
-		case progress = <-progressChan:
-		case <-doneChan:
-			fmt.Fprint(ui.output, "\r")
-			waitingForWrite = true
-		case <-ui.writtenChan:
-			fmt.Fprint(ui.output, "\r")
-			return
-		default:
-		}
-
-		fmt.Fprintf(ui.output, "\r %s ", string(progressRunes[i]))
-
+		fmt.Fprintf(ui.output, "\r %s ", nextProgressRune())
 		if waitingForWrite {
 			fmt.Fprint(ui.output, "Writing output file...")
 		} else {
@@ -205,10 +190,22 @@ func (ui *UI) updateProgress() {
 				" size: "+
 				ui.formatSize(progress.TotalSize))
 		}
+	}
+	updateProgress()
 
-		time.Sleep(100 * time.Millisecond)
-		i++
-		i %= 10
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			updateProgress()
+		case <-ui.Analyzer.GetDone():
+			fmt.Fprint(ui.output, "\r")
+			waitingForWrite = true
+		case <-ui.writtenChan:
+			fmt.Fprint(ui.output, "\r")
+			return
+		}
 	}
 }
 

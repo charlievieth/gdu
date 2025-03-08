@@ -6,6 +6,7 @@ import (
 	"math"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,11 +30,7 @@ type UI struct {
 	top       int
 }
 
-var (
-	progressRunes      = []rune(`⠇⠏⠋⠙⠹⠸⠼⠴⠦⠧`)
-	progressRunesOld   = []rune(`-\\|/`)
-	progressRunesCount = len(progressRunes)
-)
+var progressRunes = [...]rune{'⠇', '⠏', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'}
 
 // CreateStdoutUI creates UI for stdout
 func CreateStdoutUI(
@@ -76,8 +73,7 @@ func CreateStdoutUI(
 }
 
 func (ui *UI) UseOldProgressRunes() {
-	progressRunes = progressRunesOld
-	progressRunesCount = len(progressRunes)
+	progressRunes = [...]rune{'-', '\\', '|', '/', '-', '\\', '|', '/', '-', '\\'}
 }
 
 // StartUILoop stub
@@ -145,13 +141,9 @@ func (ui *UI) ListDevices(getter device.DevicesInfoGetter) error {
 
 // AnalyzePath analyzes recursively disk usage in given path
 func (ui *UI) AnalyzePath(path string, _ fs.Item) error {
-	var (
-		dir             fs.Item
-		wait            sync.WaitGroup
-		updateStatsDone chan struct{}
-	)
-	updateStatsDone = make(chan struct{}, 1)
+	updateStatsDone := make(chan struct{})
 
+	var wait sync.WaitGroup
 	if ui.ShowProgress {
 		wait.Add(1)
 		go func() {
@@ -160,13 +152,9 @@ func (ui *UI) AnalyzePath(path string, _ fs.Item) error {
 		}()
 	}
 
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		dir = ui.Analyzer.AnalyzeDir(path, ui.CreateIgnoreFunc(), ui.ConstGC)
-		dir.UpdateStats(make(fs.HardLinkedItems, 10))
-		updateStatsDone <- struct{}{}
-	}()
+	dir := ui.Analyzer.AnalyzeDir(path, ui.CreateIgnoreFunc(), ui.ConstGC)
+	dir.UpdateStats(make(fs.HardLinkedItems, 10))
+	close(updateStatsDone)
 
 	wait.Wait()
 
@@ -367,56 +355,55 @@ func (ui *UI) showReadingProgress(doneChan chan struct{}) {
 
 		time.Sleep(100 * time.Millisecond)
 		i++
-		i %= progressRunesCount
+		i %= len(progressRunes)
 	}
 }
 
 func (ui *UI) updateProgress(updateStatsDone <-chan struct{}) {
-	emptyRow := "\r"
-	for j := 0; j < 100; j++ {
-		emptyRow += " "
-	}
-
-	progressChan := ui.Analyzer.GetProgressChan()
-	analysisDoneChan := ui.Analyzer.GetDone()
-
-	var progress common.CurrentProgress
+	emptyRow := "\r" + strings.Repeat(" ", 100)
 
 	i := 0
+	nextProgressRune := func() string {
+		s := string(progressRunes[i%len(progressRunes)])
+		i++
+		return s
+	}
+
+	updateDiskUsage := func() {
+		fmt.Fprintf(ui.output, "%s \r %s Calculating disk usage...",
+			emptyRow, nextProgressRune())
+	}
+
+	updateProgress := func() {
+		progress := ui.Analyzer.GetCurrentProgress()
+		fmt.Fprintf(ui.output, "%s\r %s Scanning... Total items: %s size: %s",
+			emptyRow, nextProgressRune(),
+			ui.red.Sprint(common.FormatNumber(int64(progress.ItemCount))),
+			ui.formatSize(progress.TotalSize))
+	}
+	updateProgress() // Update once before waiting for the ticker to fire.
+
+	analysisDoneChan := ui.Analyzer.GetDone()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
 	for {
-		fmt.Fprint(ui.output, emptyRow)
-
 		select {
-		case progress = <-progressChan:
+		case <-tick.C:
+			updateProgress()
 		case <-analysisDoneChan:
+			updateDiskUsage() // Update once before starting loop
+			tick.Reset(100 * time.Millisecond)
 			for {
-				fmt.Fprint(ui.output, emptyRow)
-				fmt.Fprintf(ui.output, "\r %s ", string(progressRunes[i]))
-				fmt.Fprint(ui.output, "Calculating disk usage...")
-				time.Sleep(100 * time.Millisecond)
-				i++
-				i %= progressRunesCount
-
 				select {
 				case <-updateStatsDone:
 					fmt.Fprint(ui.output, emptyRow)
 					fmt.Fprint(ui.output, "\r")
 					return
-				default:
+				case <-tick.C:
+					updateDiskUsage()
 				}
 			}
 		}
-
-		fmt.Fprintf(ui.output, "\r %s ", string(progressRunes[i]))
-
-		fmt.Fprint(ui.output, "Scanning... Total items: "+
-			ui.red.Sprint(common.FormatNumber(int64(progress.ItemCount)))+
-			" size: "+
-			ui.formatSize(progress.TotalSize))
-
-		time.Sleep(100 * time.Millisecond)
-		i++
-		i %= progressRunesCount
 	}
 }
 

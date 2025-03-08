@@ -12,28 +12,19 @@ import (
 
 // SequentialAnalyzer implements Analyzer
 type SequentialAnalyzer struct {
-	progress         *common.CurrentProgress
-	progressChan     chan common.CurrentProgress
-	progressOutChan  chan common.CurrentProgress
-	progressDoneChan chan struct{}
-	doneChan         common.SignalGroup
-	wait             *WaitGroup
-	ignoreDir        common.ShouldDirBeIgnored
-	followSymlinks   bool
+	progress       *common.AtomicProgress
+	doneChan       common.SignalGroup
+	wait           *WaitGroup
+	ignoreDir      common.ShouldDirBeIgnored
+	followSymlinks bool
 }
 
 // CreateSeqAnalyzer returns Analyzer
 func CreateSeqAnalyzer() *SequentialAnalyzer {
 	return &SequentialAnalyzer{
-		progress: &common.CurrentProgress{
-			ItemCount: 0,
-			TotalSize: int64(0),
-		},
-		progressChan:     make(chan common.CurrentProgress, 1),
-		progressOutChan:  make(chan common.CurrentProgress, 1),
-		progressDoneChan: make(chan struct{}),
-		doneChan:         make(common.SignalGroup),
-		wait:             (&WaitGroup{}).Init(),
+		progress: &common.AtomicProgress{},
+		doneChan: make(common.SignalGroup),
+		wait:     (&WaitGroup{}).Init(),
 	}
 }
 
@@ -42,9 +33,10 @@ func (a *SequentialAnalyzer) SetFollowSymlinks(v bool) {
 	a.followSymlinks = v
 }
 
-// GetProgressChan returns channel for getting progress
-func (a *SequentialAnalyzer) GetProgressChan() chan common.CurrentProgress {
-	return a.progressOutChan
+// GetCurrentProgress returns the current scan progress and is safe
+// to call concurrently.
+func (a *SequentialAnalyzer) GetCurrentProgress() common.CurrentProgress {
+	return a.progress.CurrentProgress()
 }
 
 // GetDone returns channel for checking when analysis is done
@@ -54,10 +46,7 @@ func (a *SequentialAnalyzer) GetDone() common.SignalGroup {
 
 // ResetProgress returns progress
 func (a *SequentialAnalyzer) ResetProgress() {
-	a.progress = &common.CurrentProgress{}
-	a.progressChan = make(chan common.CurrentProgress, 1)
-	a.progressOutChan = make(chan common.CurrentProgress, 1)
-	a.progressDoneChan = make(chan struct{})
+	a.progress = a.progress.Reset()
 	a.doneChan = make(common.SignalGroup)
 }
 
@@ -72,12 +61,10 @@ func (a *SequentialAnalyzer) AnalyzeDir(
 
 	a.ignoreDir = ignore
 
-	go a.updateProgress()
 	dir := a.processDir(path)
 
 	dir.BasePath = filepath.Dir(path)
 
-	a.progressDoneChan <- struct{}{}
 	a.doneChan.Broadcast()
 
 	return dir
@@ -152,28 +139,8 @@ func (a *SequentialAnalyzer) processDir(path string) *Dir {
 		}
 	}
 
-	a.progressChan <- common.CurrentProgress{
-		CurrentItemName: path,
-		ItemCount:       len(files),
-		TotalSize:       totalSize,
-	}
+	a.progress.CurrentItemName.Store(&path)
+	a.progress.ItemCount.Add(int64(len(files)))
+	a.progress.TotalSize.Add(totalSize)
 	return dir
-}
-
-func (a *SequentialAnalyzer) updateProgress() {
-	for {
-		select {
-		case <-a.progressDoneChan:
-			return
-		case progress := <-a.progressChan:
-			a.progress.CurrentItemName = progress.CurrentItemName
-			a.progress.ItemCount += progress.ItemCount
-			a.progress.TotalSize += progress.TotalSize
-		}
-
-		select {
-		case a.progressOutChan <- *a.progress:
-		default:
-		}
-	}
 }

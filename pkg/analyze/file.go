@@ -3,6 +3,7 @@ package analyze
 import (
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dundee/gdu/v5/pkg/fs"
@@ -42,6 +43,13 @@ func (f *File) SetParent(parent fs.Item) {
 // GetPath returns absolute Get of the file
 func (f *File) GetPath() string {
 	return filepath.Join(f.Parent.GetPath(), f.Name)
+}
+
+// SetFlag sets the flag of the file and is thread-safe.
+func (f *File) SetFlag(flag rune) {
+	// This needs to be thread-safe since we update parent directory
+	// flags in parallel (such as setting an error flag).
+	atomic.StoreInt32(&f.Flag, flag)
 }
 
 // GetFlag returns flag of the file
@@ -148,6 +156,14 @@ type Dir struct {
 // AddFile add item to files
 func (f *Dir) AddFile(item fs.Item) {
 	f.Files = append(f.Files, item)
+}
+
+// AddFileLocked add item to files.
+// It is safe to call this function from multiple goroutines
+func (f *Dir) AddFileLocked(item fs.Item) {
+	f.m.Lock()
+	f.AddFile(item)
+	f.m.Unlock()
 }
 
 // GetFiles returns all files in directory

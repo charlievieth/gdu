@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -13,39 +14,33 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var concurrencyLimit = make(chan struct{}, 3*runtime.GOMAXPROCS(0))
+
 // StoredAnalyzer implements Analyzer
 type StoredAnalyzer struct {
-	storage          *Storage
-	storagePath      string
-	progress         *common.CurrentProgress
-	progressChan     chan common.CurrentProgress
-	progressOutChan  chan common.CurrentProgress
-	progressDoneChan chan struct{}
-	doneChan         common.SignalGroup
-	wait             *WaitGroup
-	ignoreDir        common.ShouldDirBeIgnored
-	followSymlinks   bool
+	storage        *Storage
+	storagePath    string
+	progress       *common.AtomicProgress
+	doneChan       common.SignalGroup
+	wait           *WaitGroup
+	ignoreDir      common.ShouldDirBeIgnored
+	followSymlinks bool
 }
 
 // CreateStoredAnalyzer returns Analyzer
 func CreateStoredAnalyzer(storagePath string) *StoredAnalyzer {
 	return &StoredAnalyzer{
 		storagePath: storagePath,
-		progress: &common.CurrentProgress{
-			ItemCount: 0,
-			TotalSize: int64(0),
-		},
-		progressChan:     make(chan common.CurrentProgress, 1),
-		progressOutChan:  make(chan common.CurrentProgress, 1),
-		progressDoneChan: make(chan struct{}),
-		doneChan:         make(common.SignalGroup),
-		wait:             (&WaitGroup{}).Init(),
+		progress:    &common.AtomicProgress{},
+		doneChan:    make(common.SignalGroup),
+		wait:        (&WaitGroup{}).Init(),
 	}
 }
 
-// GetProgressChan returns channel for getting progress
-func (a *StoredAnalyzer) GetProgressChan() chan common.CurrentProgress {
-	return a.progressOutChan
+// GetCurrentProgress returns the current scan progress and is safe
+// to call concurrently.
+func (a *StoredAnalyzer) GetCurrentProgress() common.CurrentProgress {
+	return a.progress.CurrentProgress()
 }
 
 // GetDone returns channel for checking when analysis is done
@@ -54,15 +49,13 @@ func (a *StoredAnalyzer) GetDone() common.SignalGroup {
 }
 
 func (a *StoredAnalyzer) SetFollowSymlinks(v bool) {
+	// WARN: Nothing uses this value
 	a.followSymlinks = v
 }
 
 // ResetProgress returns progress
 func (a *StoredAnalyzer) ResetProgress() {
-	a.progress = &common.CurrentProgress{}
-	a.progressChan = make(chan common.CurrentProgress, 1)
-	a.progressOutChan = make(chan common.CurrentProgress, 1)
-	a.progressDoneChan = make(chan struct{})
+	a.progress = a.progress.Reset()
 	a.doneChan = make(common.SignalGroup)
 	a.wait = (&WaitGroup{}).Init()
 }
@@ -88,12 +81,9 @@ func (a *StoredAnalyzer) AnalyzeDir(
 
 	a.ignoreDir = ignore
 
-	go a.updateProgress()
 	dir := a.processDir(path)
-
 	a.wait.Wait()
 
-	a.progressDoneChan <- struct{}{}
 	a.doneChan.Broadcast()
 
 	return dir
@@ -183,30 +173,10 @@ func (a *StoredAnalyzer) processDir(path string) *StoredDir {
 
 	a.wait.Done()
 
-	a.progressChan <- common.CurrentProgress{
-		CurrentItemName: path,
-		ItemCount:       len(files),
-		TotalSize:       totalSize,
-	}
+	a.progress.CurrentItemName.Store(&path)
+	a.progress.ItemCount.Add(int64(len(files)))
+	a.progress.TotalSize.Add(totalSize)
 	return dir
-}
-
-func (a *StoredAnalyzer) updateProgress() {
-	for {
-		select {
-		case <-a.progressDoneChan:
-			return
-		case progress := <-a.progressChan:
-			a.progress.CurrentItemName = progress.CurrentItemName
-			a.progress.ItemCount += progress.ItemCount
-			a.progress.TotalSize += progress.TotalSize
-		}
-
-		select {
-		case a.progressOutChan <- *a.progress:
-		default:
-		}
-	}
 }
 
 // StoredDir implements Dir item stored on disk

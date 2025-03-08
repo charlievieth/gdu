@@ -32,9 +32,9 @@ func (a *MockedAnalyzer) AnalyzeDir(
 	return nil
 }
 
-// GetProgressChan returns always Done
-func (a *MockedAnalyzer) GetProgressChan() chan CurrentProgress {
-	return make(chan CurrentProgress)
+// GetCurrentProgress always returns an empty CurrentProgress.
+func (a *MockedAnalyzer) GetCurrentProgress() CurrentProgress {
+	return CurrentProgress{}
 }
 
 // GetDone returns always Done

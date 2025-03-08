@@ -1,53 +1,58 @@
 package analyze
 
 import (
+	gofs "io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
+	"strings"
+	"sync"
 
+	"github.com/charlievieth/fastwalk"
 	"github.com/dundee/gdu/v5/internal/common"
 	"github.com/dundee/gdu/v5/pkg/fs"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/exp/slices"
 )
-
-var concurrencyLimit = make(chan struct{}, 3*runtime.GOMAXPROCS(0))
 
 // ParallelAnalyzer implements Analyzer
 type ParallelAnalyzer struct {
-	progress         *common.CurrentProgress
-	progressChan     chan common.CurrentProgress
-	progressOutChan  chan common.CurrentProgress
-	progressDoneChan chan struct{}
-	doneChan         common.SignalGroup
-	wait             *WaitGroup
-	ignoreDir        common.ShouldDirBeIgnored
-	followSymlinks   bool
+	dirs      sync.Map
+	conf      *fastwalk.Config
+	progress  *common.AtomicProgress
+	doneChan  common.SignalGroup
+	ignoreDir common.ShouldDirBeIgnored
 }
 
 // CreateAnalyzer returns Analyzer
 func CreateAnalyzer() *ParallelAnalyzer {
+	conf := fastwalk.DefaultConfig.Copy()
+	// WARN: this needs to be tuned !!!
+	conf.Sort = fastwalk.SortFilesFirst
+	conf.ToSlash = true
+	conf.NumWorkers = 10 // TODO: make this configurable
+	conf.Follow = false
 	return &ParallelAnalyzer{
-		progress: &common.CurrentProgress{
-			ItemCount: 0,
-			TotalSize: int64(0),
-		},
-		progressChan:     make(chan common.CurrentProgress, 1),
-		progressOutChan:  make(chan common.CurrentProgress, 1),
-		progressDoneChan: make(chan struct{}),
-		doneChan:         make(common.SignalGroup),
-		wait:             (&WaitGroup{}).Init(),
+		conf: conf,
+		// conf: fastwalk.DefaultConfig.Copy(),
+		progress: &common.AtomicProgress{},
+		// TODO: might want to make these bigger or drop
+		// any queued progress. Making this an atomic
+		// pointer that we occaisonally check would also
+		// work.
+		doneChan: make(common.SignalGroup),
 	}
 }
 
 // SetFollowSymlinks sets whether symlink to files should be followed
 func (a *ParallelAnalyzer) SetFollowSymlinks(v bool) {
-	a.followSymlinks = v
+	a.conf.Follow = v
 }
 
-// GetProgressChan returns channel for getting progress
-func (a *ParallelAnalyzer) GetProgressChan() chan common.CurrentProgress {
-	return a.progressOutChan
+// GetCurrentProgress returns the current scan progress and is safe
+// to call concurrently.
+func (a *ParallelAnalyzer) GetCurrentProgress() common.CurrentProgress {
+	return a.progress.CurrentProgress()
 }
 
 // GetDone returns channel for checking when analysis is done
@@ -57,12 +62,8 @@ func (a *ParallelAnalyzer) GetDone() common.SignalGroup {
 
 // ResetProgress returns progress
 func (a *ParallelAnalyzer) ResetProgress() {
-	a.progress = &common.CurrentProgress{}
-	a.progressChan = make(chan common.CurrentProgress, 1)
-	a.progressOutChan = make(chan common.CurrentProgress, 1)
-	a.progressDoneChan = make(chan struct{})
+	a.progress = a.progress.Reset()
 	a.doneChan = make(common.SignalGroup)
-	a.wait = (&WaitGroup{}).Init()
 }
 
 // AnalyzeDir analyzes given path
@@ -76,130 +77,45 @@ func (a *ParallelAnalyzer) AnalyzeDir(
 
 	a.ignoreDir = ignore
 
-	go a.updateProgress()
-	dir := a.processDir(path)
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if err := fastwalk.Walk(a.conf, clean, a.walk); err != nil {
+		log.Println(err)
+	}
 
-	dir.BasePath = filepath.Dir(path)
-	a.wait.Wait()
+	// dir, ok := a.loadDir(filepath.Clean(path))
+	dir, ok := a.loadDir(clean)
+	if !ok {
+		log.Errorf("missing root directory: %s\n", clean)
+		return nil
+	}
 
-	a.progressDoneChan <- struct{}{}
+	// TODO: could we recursively do this using the root dir?
+	// start = time.Now()
+	a.dirs.Range(func(_, v any) bool {
+		dd := v.(*Dir)
+		// TODO: check for loops with: `dd.Parent == dd` ???
+		files := dd.GetFiles()
+		dd.Flag = getDirFlag(nil, len(files))
+
+		// TODO: make sure that we don't need this only for tests !!!
+		//
+		if len(files) > 1 {
+			slices.SortFunc(files, func(f1, f2 fs.Item) int {
+				return strings.Compare(f1.GetName(), f2.GetName())
+			})
+			dd.SetFiles(files)
+		}
+		return true
+	})
+	dir.BasePath = filepath.Dir(clean)
+
 	a.doneChan.Broadcast()
 
+	// WARN: we should probably clear the sync map
+	a.dirs.Clear()
+	a.dirs = sync.Map{}
+
 	return dir
-}
-
-func (a *ParallelAnalyzer) processDir(path string) *Dir {
-	var (
-		file       *File
-		err        error
-		totalSize  int64
-		info       os.FileInfo
-		subDirChan = make(chan *Dir)
-		dirCount   int
-	)
-
-	a.wait.Add(1)
-
-	files, err := os.ReadDir(path)
-	if err != nil {
-		log.Print(err.Error())
-	}
-
-	dir := &Dir{
-		File: &File{
-			Name: filepath.Base(path),
-			Flag: getDirFlag(err, len(files)),
-		},
-		ItemCount: 1,
-		Files:     make(fs.Files, 0, len(files)),
-	}
-	setDirPlatformSpecificAttrs(dir, path)
-
-	for _, f := range files {
-		name := f.Name()
-		entryPath := filepath.Join(path, name)
-		if f.IsDir() {
-			if a.ignoreDir(name, entryPath) {
-				continue
-			}
-			dirCount++
-
-			go func(entryPath string) {
-				concurrencyLimit <- struct{}{}
-				subdir := a.processDir(entryPath)
-				subdir.Parent = dir
-
-				subDirChan <- subdir
-				<-concurrencyLimit
-			}(entryPath)
-		} else {
-			info, err = f.Info()
-			if err != nil {
-				log.Print(err.Error())
-				dir.Flag = '!'
-				continue
-			}
-			if a.followSymlinks && info.Mode()&os.ModeSymlink != 0 {
-				infoF, err := followSymlink(entryPath)
-				if err != nil {
-					log.Print(err.Error())
-					dir.Flag = '!'
-					continue
-				}
-				if infoF != nil {
-					info = infoF
-				}
-			}
-
-			file = &File{
-				Name:   name,
-				Flag:   getFlag(info),
-				Size:   info.Size(),
-				Parent: dir,
-			}
-			setPlatformSpecificAttrs(file, info)
-
-			totalSize += info.Size()
-
-			dir.AddFile(file)
-		}
-	}
-
-	go func() {
-		var sub *Dir
-
-		for i := 0; i < dirCount; i++ {
-			sub = <-subDirChan
-			dir.AddFile(sub)
-		}
-
-		a.wait.Done()
-	}()
-
-	a.progressChan <- common.CurrentProgress{
-		CurrentItemName: path,
-		ItemCount:       len(files),
-		TotalSize:       totalSize,
-	}
-	return dir
-}
-
-func (a *ParallelAnalyzer) updateProgress() {
-	for {
-		select {
-		case <-a.progressDoneChan:
-			return
-		case progress := <-a.progressChan:
-			a.progress.CurrentItemName = progress.CurrentItemName
-			a.progress.ItemCount += progress.ItemCount
-			a.progress.TotalSize += progress.TotalSize
-		}
-
-		select {
-		case a.progressOutChan <- *a.progress:
-		default:
-		}
-	}
 }
 
 func getDirFlag(err error, items int) rune {
@@ -213,7 +129,106 @@ func getDirFlag(err error, items int) rune {
 	}
 }
 
+func (a *ParallelAnalyzer) storeDir(path string, dir *Dir) {
+	a.dirs.Store(path, dir)
+}
+
+func (a *ParallelAnalyzer) loadDir(path string) (*Dir, bool) {
+	if v, _ := a.dirs.Load(path); v != nil {
+		return v.(*Dir), true
+	}
+	return nil, false
+}
+
+func (a *ParallelAnalyzer) walk(path string, de gofs.DirEntry, err error) error {
+	if err != nil {
+		if os.IsPermission(err) {
+			return nil
+		}
+		return err
+	}
+
+	// path = filepath.Clean(path)
+	dirname, basename := filepath.Split(path)
+	if n := len(dirname); n > 1 && dirname[n-1] == '/' {
+		dirname = dirname[:n-1] // Trim trailing slash
+	}
+
+	// WARN: this cuts down one memory use at the cost of time
+	// basename = strings.Clone(basename)
+
+	// TODO: maybe check for symlink here instead of below
+	if de.IsDir() {
+		if a.ignoreDir != nil && a.ignoreDir(basename, path) {
+			return fastwalk.SkipDir
+		}
+		dir := &Dir{
+			File: &File{
+				Name: basename,
+			},
+			ItemCount: 1,
+		}
+		setDirPlatformSpecificAttrs(dir, path)
+		// a.storeDir(filepath.Clean(path), dir)
+		a.storeDir(path, dir)
+		// if parent, ok := a.loadDir(filepath.Dir(path)); ok {
+		if len(dirname) < len(path) {
+			if parent, ok := a.loadDir(dirname); ok {
+				dir.Parent = parent
+				parent.AddFileLocked(dir)
+			}
+		}
+
+		// Only update name for directories to prevent churn
+		a.progress.CurrentItemName.Store(&path)
+	} else {
+		dir, ok := a.loadDir(dirname)
+		if !ok {
+			log.Errorf("missing directory: %s\n", path)
+			return nil
+		}
+		// TOOD: Explain why we don't use de.Info() here
+		info, err := os.Lstat(path)
+		if err != nil {
+			log.Error(err)
+			dir.SetFlag('!')
+			return nil
+		}
+		// WARN: I really think we need to check for symlink at the top
+		// otherwise we may lookup the wrong thing
+		if a.conf.Follow && info.Mode()&os.ModeSymlink != 0 {
+			// TODO: the other code uses followSymlink() which seems excessive
+			fi, err := fastwalk.StatDirEntry(path, de)
+			if err != nil {
+				log.Error(err)
+				dir.SetFlag('!')
+				return nil
+			}
+			// Ignore symlinks since they will be visited again (WARN: is that correct?)
+			if fi.IsDir() {
+				return nil
+			}
+			info = fi
+		}
+
+		file := &File{
+			Name:   basename,
+			Flag:   getFlag(info),
+			Size:   info.Size(),
+			Parent: dir,
+		}
+		setPlatformSpecificAttrs(file, info)
+		dir.AddFileLocked(file)
+
+		a.progress.TotalSize.Add(info.Size())
+	}
+
+	a.progress.ItemCount.Add(1)
+	return nil
+}
+
 func getFlag(f os.FileInfo) rune {
+	// TODO: Add a flag for broken symlinks
 	if f.Mode()&os.ModeSymlink != 0 || f.Mode()&os.ModeSocket != 0 {
 		return '@'
 	}

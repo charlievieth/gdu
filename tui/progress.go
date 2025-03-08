@@ -13,41 +13,40 @@ func (ui *UI) updateProgress() {
 		color = "[red:black:b]"
 	}
 
-	progressChan := ui.Analyzer.GetProgressChan()
-	doneChan := ui.Analyzer.GetDone()
-
-	var progress common.CurrentProgress
 	start := time.Now()
 
+	update := func() {
+		ui.app.QueueUpdateDraw(func() {
+			delta := time.Since(start).Round(time.Second)
+			progress := ui.Analyzer.GetCurrentProgress()
+			ui.progress.SetText("Total items: " +
+				color +
+				common.FormatNumber(int64(progress.ItemCount)) +
+				"[white:black:-], size: " +
+				color +
+				ui.formatSize(progress.TotalSize, false, false) +
+				"[white:black:-], elapsed time: " +
+				color +
+				delta.String() +
+				"[white:black:-]\nCurrent item: [white:black:b]" +
+				path.ShortenPath(progress.CurrentItemName, ui.currentItemNameMaxLen))
+		})
+	}
+	update() // Update once before waiting for the ticker to fire.
+
+	done := ui.Analyzer.GetDone()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
 	for {
 		select {
-		case progress = <-progressChan:
-		case <-doneChan:
+		case <-done:
 			ui.app.QueueUpdateDraw(func() {
 				ui.progress.SetTitle(" Finalizing... ")
 				ui.progress.SetText("Calculating disk usage...")
 			})
 			return
+		case <-tick.C:
+			update()
 		}
-
-		func(itemCount int, totalSize int64, currentItem string) {
-			delta := time.Since(start).Round(time.Second)
-
-			ui.app.QueueUpdateDraw(func() {
-				ui.progress.SetText("Total items: " +
-					color +
-					common.FormatNumber(int64(itemCount)) +
-					"[white:black:-], size: " +
-					color +
-					ui.formatSize(totalSize, false, false) +
-					"[white:black:-], elapsed time: " +
-					color +
-					delta.String() +
-					"[white:black:-]\nCurrent item: [white:black:b]" +
-					path.ShortenPath(currentItem, ui.currentItemNameMaxLen))
-			})
-		}(progress.ItemCount, progress.TotalSize, progress.CurrentItemName)
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }
