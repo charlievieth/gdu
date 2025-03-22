@@ -1,14 +1,17 @@
 package app
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
-	"net/http/pprof"
+	npprof "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -67,6 +70,9 @@ type Flags struct {
 	NoDelete           bool     `yaml:"no-delete"`
 	FollowSymlinks     bool     `yaml:"follow-symlinks"`
 	Profiling          bool     `yaml:"profiling"`
+	CPUProfile         string   `yaml:"cpu-profile"`
+	MemProfile         string   `yaml:"mem-profile"`
+	MemProfileRate     int      `yaml:"mem-profile-rate"`
 	ConstGC            bool     `yaml:"const-gc"`
 	UseStorage         bool     `yaml:"use-storage"`
 	StoragePath        string   `yaml:"storage-path"`
@@ -412,14 +418,53 @@ func (a *App) setNoCross(path string) error {
 	return nil
 }
 
+func bufferedFileWriter(dest string) (io.Writer, func(), error) {
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, nil, err
+	}
+	bw := bufio.NewWriter(f)
+	close := func() {
+		if err := errors.Join(bw.Flush(), f.Close()); err != nil {
+			log.Error(err)
+		}
+	}
+	return bw, close, nil
+}
+
 func (a *App) runAction(ui UI, path string) error {
+	if a.Flags.CPUProfile != "" {
+		bw, flush, err := bufferedFileWriter(a.Flags.CPUProfile)
+		if err != nil {
+			return err
+		}
+		defer flush()
+		_ = pprof.StartCPUProfile(bw)
+		defer pprof.StopCPUProfile()
+	}
+	if a.Flags.MemProfile != "" {
+		if a.Flags.MemProfileRate > 0 {
+			runtime.MemProfileRate = a.Flags.MemProfileRate
+		}
+		bw, flush, err := bufferedFileWriter(a.Flags.MemProfile)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			runtime.GC() // materialize all statistics
+			if err := pprof.WriteHeapProfile(bw); err != nil {
+				log.Fatal(err)
+			}
+			flush()
+		}()
+	}
 	if a.Flags.Profiling {
 		go func() {
-			http.HandleFunc("/debug/pprof/", pprof.Index)
-			http.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-			http.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			http.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-			http.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			http.HandleFunc("/debug/pprof/", npprof.Index)
+			http.HandleFunc("/debug/pprof/cmdline", npprof.Cmdline)
+			http.HandleFunc("/debug/pprof/profile", npprof.Profile)
+			http.HandleFunc("/debug/pprof/symbol", npprof.Symbol)
+			http.HandleFunc("/debug/pprof/trace", npprof.Trace)
 			log.Println(http.ListenAndServe("localhost:6060", nil))
 		}()
 	}
