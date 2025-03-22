@@ -140,6 +140,21 @@ func (a *ParallelAnalyzer) loadDir(path string) (*Dir, bool) {
 	return nil, false
 }
 
+// dirName is filepath.Dir for clean paths. The only difference
+// between it and filepath.Dir is that is does not call
+// filepath.Clean on the result.
+func dirName(path string) string {
+	vol := filepath.VolumeName(path)
+	i := len(path) - 1
+	for i >= len(vol) && !os.IsPathSeparator(path[i]) {
+		i--
+	}
+	if i <= 0 {
+		return path
+	}
+	return path[:i]
+}
+
 func (a *ParallelAnalyzer) walk(path string, de gofs.DirEntry, err error) error {
 	if err != nil {
 		if os.IsPermission(err) {
@@ -147,24 +162,16 @@ func (a *ParallelAnalyzer) walk(path string, de gofs.DirEntry, err error) error 
 		}
 		return err
 	}
-
-	// path = filepath.Clean(path)
-	dirname, basename := filepath.Split(path)
-	if n := len(dirname); n > 1 && dirname[n-1] == '/' {
-		dirname = dirname[:n-1] // Trim trailing slash
-	}
-
-	// WARN: this cuts down one memory use at the cost of time
-	// basename = strings.Clone(basename)
+	dirname := dirName(path)
 
 	// TODO: maybe check for symlink here instead of below
 	if de.IsDir() {
-		if a.ignoreDir != nil && a.ignoreDir(basename, path) {
+		if a.ignoreDir != nil && a.ignoreDir(de.Name(), path) {
 			return fastwalk.SkipDir
 		}
 		dir := &Dir{
 			File: &File{
-				Name: basename,
+				Name: de.Name(),
 			},
 			ItemCount: 1,
 		}
@@ -212,7 +219,7 @@ func (a *ParallelAnalyzer) walk(path string, de gofs.DirEntry, err error) error 
 		}
 
 		file := &File{
-			Name:   basename,
+			Name:   de.Name(),
 			Flag:   getFlag(info),
 			Size:   info.Size(),
 			Parent: dir,
